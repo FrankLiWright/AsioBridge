@@ -358,14 +358,37 @@ public sealed class MainForm : Form
         _statusLabel.ForeColor = color;
     }
 
+    private bool _busy;
+
     private void Toggle()
     {
+        if (_busy) return;
+
         if (_engine.IsRunning)
         {
-            _engine.Stop();
-            SetStatus("已停止", TextDim);
-            _peakMeter.SetPeaks(0, 0);
-            UpdateUi();
+            // Stop off the UI thread: ASIO drivers can block in Stop().
+            _busy = true;
+            _startStop.Enabled = false;
+            SetStatus("停止中…", TextDim);
+            Task.Run(() =>
+            {
+                try { _engine.Stop(); }
+                catch { /* ignore */ }
+                try
+                {
+                    BeginInvoke(() =>
+                    {
+                        _busy = false;
+                        _startStop.Enabled = true;
+                        SetStatus("已停止", TextDim);
+                        _peakMeter.SetPeaks(0, 0);
+                        UpdateUi();
+                    });
+                }
+                catch (ObjectDisposedException)
+                {
+                }
+            });
             return;
         }
 
