@@ -54,6 +54,7 @@ internal sealed class ProcessLoopbackSource : IDisposable
     private IntPtr _eventHandle;
     private Thread? _thread;
     private volatile bool _running;
+    private int _comReleased;
 
     public event EventHandler<WaveInEventArgs>? DataAvailable;
     public event EventHandler<StoppedEventArgs>? RecordingStopped;
@@ -97,16 +98,22 @@ internal sealed class ProcessLoopbackSource : IDisposable
         {
             NativeMethods.SetEvent(_eventHandle);
         }
-        if (_thread != null)
-        {
-            _thread.Join(3000);
-            _thread = null;
-        }
+
+        var thread = _thread;
+        _thread = null;
+        // Bounded wait — never block the caller for long.
+        thread?.Join(1000);
     }
 
     public void Dispose()
     {
-        Stop();
+        _running = false;
+        if (_eventHandle != IntPtr.Zero)
+        {
+            NativeMethods.SetEvent(_eventHandle);
+        }
+
+        // Don't Join here if Stop() already did; just release COM once.
         CleanupCom();
     }
 
@@ -119,16 +126,17 @@ internal sealed class ProcessLoopbackSource : IDisposable
             var buffer = new byte[_waveFormat.AverageBytesPerSecond / 4]; // ~250ms max chunk
             while (_running)
             {
-                NativeMethods.WaitForSingleObject(_eventHandle, 200);
+                NativeMethods.WaitForSingleObject(_eventHandle, 100);
                 if (!_running) break;
+                if (_captureClient == null) break;
 
-                int hr = _captureClient!.GetNextPacketSize(out uint packetLength);
-                if (hr != 0) Marshal.ThrowExceptionForHR(hr);
+                int hr = _captureClient.GetNextPacketSize(out uint packetLength);
+                if (hr != 0) break;
 
-                while (packetLength > 0)
+                while (packetLength > 0 && _running)
                 {
                     hr = _captureClient.GetBuffer(out IntPtr dataPtr, out uint numFrames, out AudioClientBufferFlags flags, out _, out _);
-                    if (hr != 0) Marshal.ThrowExceptionForHR(hr);
+                    if (hr != 0) goto done;
 
                     int bytes = (int)(numFrames * (uint)_waveFormat.BlockAlign);
                     if (bytes > buffer.Length) buffer = new byte[bytes];
@@ -143,7 +151,7 @@ internal sealed class ProcessLoopbackSource : IDisposable
                     }
 
                     hr = _captureClient.ReleaseBuffer(numFrames);
-                    if (hr != 0) Marshal.ThrowExceptionForHR(hr);
+                    if (hr != 0) goto done;
 
                     if (bytes > 0 && DataAvailable != null)
                     {
@@ -151,11 +159,11 @@ internal sealed class ProcessLoopbackSource : IDisposable
                     }
 
                     hr = _captureClient.GetNextPacketSize(out packetLength);
-                    if (hr != 0) Marshal.ThrowExceptionForHR(hr);
+                    if (hr != 0) goto done;
                 }
             }
-
-            try { _audioClient?.Stop(); } catch { /* ignore */ }
+        done:
+            // COM client is stopped in CleanupCom only — avoid double Stop() hanging drivers.
             RecordingStopped?.Invoke(this, new StoppedEventArgs(null));
         }
         catch (Exception ex)
@@ -267,6 +275,9 @@ internal sealed class ProcessLoopbackSource : IDisposable
 
     private void CleanupCom()
     {
+        if (Interlocked.Exchange(ref _comReleased, 1) == 1)
+            return;
+
         if (_eventHandle != IntPtr.Zero)
         {
             NativeMethods.CloseHandle(_eventHandle);
