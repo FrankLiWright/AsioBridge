@@ -56,6 +56,7 @@ public sealed class BridgeEngine : IDisposable
     private long _capCount;
     private long _peakTicks;
     private volatile bool _running;
+    private int _stopPending;
 
     public bool IsRunning => _running;
 
@@ -96,13 +97,68 @@ public sealed class BridgeEngine : IDisposable
         }
     }
 
+    /// <summary>
+    /// Stop capture and ASIO. Safe to call from the UI thread: the potentially
+    /// blocking driver/COM teardown runs on a worker with a bounded wait.
+    /// </summary>
     public void Stop()
     {
-        lock (_gate)
+        if (Interlocked.Exchange(ref _stopPending, 1) == 1)
+            return;
+
+        try
         {
-            StopCore();
-            _running = false;
+            // Detach live objects under the lock, then tear down outside it.
+            ProcessLoopbackCapture? proc;
+            WasapiLoopbackCapture? sys;
+            AsioOut? asio;
+            lock (_gate)
+            {
+                _running = false;
+                proc = _processCapture;
+                sys = _systemCapture;
+                asio = _asioOut;
+                _processCapture = null;
+                _systemCapture = null;
+                _asioOut = null;
+                _ring?.Clear();
+                _ring = null;
+            }
+
+            // Producer side first so it stops filling the ring.
+            if (proc != null)
+            {
+                proc.DataAvailable -= OnCaptureData;
+                try { proc.StopRecording(); } catch { /* ignore */ }
+            }
+            if (sys != null)
+            {
+                sys.DataAvailable -= OnCaptureData;
+                try { sys.StopRecording(); } catch { /* ignore */ }
+            }
+
+            // ASIO Stop/Dispose is the usual freeze point (driver waits on its callback).
+            if (asio != null)
+            {
+                using var done = new ManualResetEventSlim(false);
+                ThreadPool.QueueUserWorkItem(_ =>
+                {
+                    try { asio.Stop(); } catch { /* ignore */ }
+                    try { asio.Dispose(); } catch { /* ignore */ }
+                    done.Set();
+                });
+                // Bounded wait: never block the caller (UI) indefinitely.
+                done.Wait(2000);
+            }
+
+            try { proc?.Dispose(); } catch { /* ignore */ }
+            try { sys?.Dispose(); } catch { /* ignore */ }
+
             StatusChanged?.Invoke(new BridgeStatus { IsRunning = false });
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _stopPending, 0);
         }
     }
 
@@ -357,6 +413,7 @@ public sealed class BridgeEngine : IDisposable
 
     private void StopCore()
     {
+        // Used by Start() failure path — objects were just created, teardown is cheap.
         try { _asioOut?.Stop(); } catch { /* ignore */ }
         try { _asioOut?.Dispose(); } catch { /* ignore */ }
         _asioOut = null;
